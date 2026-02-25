@@ -2,6 +2,51 @@ import type { Request, Response } from 'express';
 import Product from '../models/Product.ts';
 import Category from '../models/Category.ts';
 
+type PricingNormalized = {
+  size: number;
+  price: number;
+};
+
+const normalizeAndValidatePricing = (pricing: any): { pricing: PricingNormalized[] } | { error: string } => {
+  if (!pricing || !Array.isArray(pricing) || pricing.length === 0) {
+    return { error: 'Product must have at least one pricing option' };
+  }
+
+  const normalized: PricingNormalized[] = [];
+
+  for (const item of pricing) {
+    // normalize size
+    const size =
+      typeof item?.size === 'string'
+        ? Number(item.size)
+        : item?.size;
+
+    // normalize price
+    const price =
+      typeof item?.price === 'string'
+        ? Number(item.price)
+        : item?.price;
+
+    if (size === undefined || typeof size !== 'number' || Number.isNaN(size)) {
+      return { error: 'Each pricing option must have a valid numeric size' };
+    }
+
+    if (price === undefined || typeof price !== 'number' || Number.isNaN(price) || price < 0) {
+      return { error: 'Each pricing option must have a valid price (>= 0)' };
+    }
+
+    normalized.push({ size, price });
+  }
+
+  // prevent duplicate sizes
+  const sizes = normalized.map((p) => p.size);
+  if (new Set(sizes).size !== sizes.length) {
+    return { error: 'Duplicate size found in pricing options' };
+  }
+
+  return { pricing: normalized };
+};
+
 // CREATE - Create new product
 export const createProduct = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -9,50 +54,24 @@ export const createProduct = async (req: Request, res: Response): Promise<void> 
 
     // Validate and get category
     const categoryDoc = await Category.findById(category);
-    
     if (!categoryDoc) {
-      res.status(404).json({
-        success: false,
-        message: 'Category not found',
-      });
+      res.status(404).json({ success: false, message: 'Category not found' });
       return;
     }
 
-    // Validate pricing array
-    if (!pricing || !Array.isArray(pricing) || pricing.length === 0) {
-      res.status(400).json({
-        success: false,
-        message: 'Product must have at least one pricing option',
-      });
+    // Normalize + validate pricing (size is Number, random allowed)
+    const pricingResult = normalizeAndValidatePricing(pricing);
+    if ('error' in pricingResult) {
+      res.status(400).json({ success: false, message: pricingResult.error });
       return;
     }
 
-    // Validate each pricing option
-    const validSizes = ['small', 'medium', 'large'];
-    for (const price of pricing) {
-      if (!price.size || !validSizes.includes(price.size)) {
-        res.status(400).json({
-          success: false,
-          message: `Invalid size. Must be one of: ${validSizes.join(', ')}`,
-        });
-        return;
-      }
-      if (price.price === undefined || price.price < 0) {
-        res.status(400).json({
-          success: false,
-          message: 'Each pricing option must have a valid price (>= 0)',
-        });
-        return;
-      }
-    }
-
-    // Create product with auto-filled categName
     const product = new Product({
       ProductName,
       type,
       category: categoryDoc._id,
-      categName: categoryDoc.categName,  // ← Auto-fill from category
-      pricing,
+      categName: categoryDoc.categName, // auto-fill from category
+      pricing: pricingResult.pricing,
       color,
       images,
       description,
@@ -62,7 +81,6 @@ export const createProduct = async (req: Request, res: Response): Promise<void> 
 
     await product.save();
 
-    // Return product without populating (categName is already there)
     const productObj = product.toObject();
     delete productObj.__v;
 
@@ -83,7 +101,7 @@ export const createProduct = async (req: Request, res: Response): Promise<void> 
 // READ ALL - Get all products
 export const getAllProducts = async (req: Request, res: Response): Promise<void> => {
   try {
-    const products = await Product.find();
+    const products = await Product.find().select('-__v');
     res.status(200).json({
       success: true,
       count: products.length,
@@ -102,7 +120,7 @@ export const getAllProducts = async (req: Request, res: Response): Promise<void>
 export const getProductById = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const product = await Product.findById(id);
+    const product = await Product.findById(id).select('-__v');
 
     if (!product) {
       res.status(404).json({
@@ -130,7 +148,6 @@ export const getProductsByCategory = async (req: Request, res: Response): Promis
   try {
     const { categoryId } = req.params;
 
-    // Validate category exists
     const categoryDoc = await Category.findById(categoryId);
     if (!categoryDoc) {
       res.status(404).json({
@@ -160,7 +177,7 @@ export const getProductsByCategory = async (req: Request, res: Response): Promis
 export const getProductsByCategoryName = async (req: Request, res: Response): Promise<void> => {
   try {
     const { categName } = req.params;
-    
+
     const products = await Product.find({ categName }).select('-__v');
 
     res.status(200).json({
@@ -181,7 +198,7 @@ export const getProductsByCategoryName = async (req: Request, res: Response): Pr
 export const getProductsByType = async (req: Request, res: Response): Promise<void> => {
   try {
     const { type } = req.params;
-    
+
     if (type !== 'custom' && type !== 'catalogue') {
       res.status(400).json({
         success: false,
@@ -210,12 +227,12 @@ export const getProductsByType = async (req: Request, res: Response): Promise<vo
 export const updateProduct = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const updateData = req.body;
+    const updateData: any = { ...req.body };
 
     // If updating category, validate and update categName
     if (updateData.category) {
       const categoryDoc = await Category.findById(updateData.category);
-      
+
       if (!categoryDoc) {
         res.status(404).json({
           success: false,
@@ -223,37 +240,18 @@ export const updateProduct = async (req: Request, res: Response): Promise<void> 
         });
         return;
       }
-      
-      updateData.categName = categoryDoc.categName;  // ← Auto-update categName
+
+      updateData.categName = categoryDoc.categName;
     }
 
-    // Validate pricing if provided
+    // Normalize + validate pricing if provided
     if (updateData.pricing) {
-      if (!Array.isArray(updateData.pricing) || updateData.pricing.length === 0) {
-        res.status(400).json({
-          success: false,
-          message: 'Product must have at least one pricing option',
-        });
+      const pricingResult = normalizeAndValidatePricing(updateData.pricing);
+      if ('error' in pricingResult) {
+        res.status(400).json({ success: false, message: pricingResult.error });
         return;
       }
-
-      const validSizes = ['small', 'medium', 'large'];
-      for (const price of updateData.pricing) {
-        if (!price.size || !validSizes.includes(price.size)) {
-          res.status(400).json({
-            success: false,
-            message: `Invalid size. Must be one of: ${validSizes.join(', ')}`,
-          });
-          return;
-        }
-        if (price.price === undefined || price.price < 0) {
-          res.status(400).json({
-            success: false,
-            message: 'Each pricing option must have a valid price (>= 0)',
-          });
-          return;
-        }
-      }
+      updateData.pricing = pricingResult.pricing;
     }
 
     const product = await Product.findByIdAndUpdate(id, updateData, {
